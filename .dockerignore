@@ -1,0 +1,15 @@
+**/.git
+**/.gitignore
+**/.config
+**/bin
+**/obj
+**/logs
+**/dist
+**/node_modules
+**/*.log
+**/*.user
+**/*.suo
+**/.vs/
+**/sealedtrace-.log
+appsettings.Development.appsettings.json
+launchSettings.json

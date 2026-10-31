@@ -1,0 +1,40 @@
+# Build output
+bin/
+obj/
+artifacts/
+*.user
+*.suo
+
+# IDE
+.vs/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+*.pfx
+*.snk
+secrets.json
+
+# Logs and OS noise
+logs/
+# ...but re-include source directories that merely share the name
+!console/src/features/logs/
+!src/SealedTrace.Core/Dtos/Logs/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,55 @@
+version: "3.8"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sealedtrace-sqlserver
+    environment:
+      SA_PASSWORD: "SealedTrace_Strong!Password123"
+      ACCEPT_EULA: "Y"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sealedtrace_sqlserver_data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "SA", "-P", "SealedTrace_Strong!Password123", "-Q", "SELECT 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - sealedtrace
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sealedtrace-api
+    environment:
+      ConnectionStrings__Default: "Server=sqlserver,1433;Database=SealedTrace;User Id=SA;Password=SealedTrace_Strong!Password123;TrustServerCertificate=True;Encrypt=True"
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:5080"
+      Jwt__SigningKey: "CHANGE_ME_32_BYTE_SECRET_KEY_CHANGE_ME_32_BYTE"
+      Jwt__Issuer: "sealedtrace-api"
+      Jwt__Audience: "sealedtrace-console"
+      SealedTrace__MasterKey: "CHANGE_ME_BASE64_32_BYTE_MASTER_KEY_OVERRIDE_VIA_KEY_VAULT"
+      SealedTrace__MasterKeyVersion: "1"
+      Cors__AllowedOrigins__0: "http://localhost:5173"
+      Retention__DefaultMaxAgeDays: "30"
+      Retention__DefaultMaxEvents: "1000000"
+      Search__UseFullText: "false"
+      Metrics__Enabled: "false"
+    ports:
+      - "5080:5080"
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - sealedtrace
+
+networks:
+  sealedtrace:
+    driver: bridge
+
+volumes:
+  sealedtrace_sqlserver_data:

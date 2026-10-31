@@ -1,0 +1,213 @@
+# PROJECT SPEC — SealedTrace Platform (Backend C#/.NET + Console React TS)
+# Instruction: Analyze this spec thoroughly and generate ONE file named
+# IMPLEMENTATION.md that a developer can follow to build this platform phase by
+# phase. DO NOT write any code in this turn. Resolve ambiguity with industry
+# best practice and record it under "Assumptions & Resolved Questions".
+
+## 1. ROLE
+You are a senior full-stack architect (ASP.NET Core / C# + React/TypeScript).
+You design secure, multi-tenant, production-grade SaaS backends and clean
+operator consoles.
+
+## 2. PRODUCT OVERVIEW
+SealedTrace is a secure logging platform built by Arovyx Studio:
+  - SealedTrace SDK (Flutter/Dart package `sealed_trace`) — the client. It seals
+    every log batch with hybrid encryption ON DEVICE. This spec does NOT cover
+    the SDK, but the client-server contract (section 3) is FIXED and shared with
+    the SDK team — implement it exactly, byte-for-byte on field names.
+  - SealedTrace Server (this spec, part A): .NET 8 + ASP.NET Core Web API + EF
+    Core + SQL Server.
+  - SealedTrace Console (this spec, part B): React 18 + TypeScript web dashboard
+    where users create projects, connect the SDK, and view/search logs.
+Security model (NON-NEGOTIABLE): logs arrive encrypted; ONLY the server can
+decrypt them (RSA private key per project). Device-side attackers see only
+ciphertext. Plaintext logs exist only in server memory during ingest and in
+SQL Server (TDE at-rest encryption is a deployment choice — note it).
+
+## 3. FIXED CLIENT-SERVER CONTRACT (shared with SDK — do not alter)
+### 3.1 SealedEnvelope (upload request item; also the on-disk client format)
+{
+  "v": 1,
+  "batchId": "<uuid-v4>",
+  "projectId": "<uuid-v4>",
+  "createdAt": "2026-01-01T10:00:00.000Z",
+  "eventCount": 25,
+  "alg": "RSA-OAEP-2048-SHA256+AES-256-GCM",
+  "wrappedKey": "<base64>",
+  "iv": "<base64, 12 bytes>",
+  "tag": "<base64, 16 bytes>",
+  "ciphertext": "<base64>"
+}
+Decryption = RSA-OAEP-2048 (SHA-256) unwrap wrappedKey -> AES-256-GCM key;
+AES-GCM decrypt(iv, ciphertext, tag) -> UTF-8 JSON array of LogEvent objects.
+(.NET: RSAEncryptionPadding.OaepSHA256 + AesGcm class, 12-byte nonce.)
+### 3.2 LogEvent (the decrypted payload item)
+{
+  "id": "<uuid-v4>", "seq": 1234,
+  "ts": "2026-01-01T10:00:00.000Z",
+  "level": "verbose|debug|info|warning|error|fatal",
+  "tag": "auth", "message": "<masked text>",
+  "error": "<masked text or null>", "stackTrace": "<masked text or null>",
+  "metadata": { }, "sessionId": "<uuid or null>", "userId": "<string or null>",
+  "ctx": { "appVersion": "1.2.3", "buildNumber": "45",
+           "platform": "android|ios|web|windows|macos|linux",
+           "os": "...", "locale": "en_IN", "env": "prod",
+           "network": "wifi|mobile|none|unknown" }
+}
+### 3.3 Ingest API
+POST /api/v1/ingest/logs
+  Headers: X-Api-Key: <apiKey>, Content-Type: application/json
+  Body: { "envelopes": [ SealedEnvelope, ... ] }  // max 50 envelopes / 2 MB
+  202: { "accepted": ["batchId"], "duplicate": ["batchId"],
+         "rejected": [{"batchId","reason"}] }
+  Errors: 401 invalid key, 403 revoked key, 413 too large, 429 rate-limited.
+### 3.4 Golden test vectors
+tests/TestData/envelope_vectors.json (SAME file as SDK team's): fixed test-only
+RSA keypair + known plaintext -> expected wrappedKey/iv/tag/ciphertext. Ingest
+integration tests MUST decrypt these successfully. This proves cross-compat.
+
+## 4. PART A — SealedTrace Server (.NET 8, ASP.NET Core Web API, EF Core, SQL Server)
+### 4.1 Solution structure (pragmatic clean architecture)
+SealedTrace.sln
+  src/SealedTrace.Api           — controllers, middleware, DI, Swagger
+  src/SealedTrace.Core          — entities, DTOs, interfaces, domain services
+  src/SealedTrace.Infrastructure — EF Core DbContext, SQL Server, repositories,
+                                   crypto services
+  src/SealedTrace.Jobs          — hosted background services (retention)
+  tests/SealedTrace.Tests       — xUnit unit + integration tests
+                                 (WebApplicationFactory + Testcontainers MSSQL)
+Base namespace: Arovyx.SealedTrace.*
+Optional docker-compose.yml: api + sqlserver (latest), healthchecks.
+
+### 4.2 Features
+A. Auth: register/login/refresh/logout — JWT access token 15min + refresh token
+   30d with rotation (RefreshTokens table), BCrypt.Net-Next password hashing,
+   /me endpoint. JWT via Microsoft.AspNetCore.Authentication.JwtBearer.
+B. Projects (multi-tenant per user): CRUD, name, slug, retention policy fields
+   (maxAgeDays, maxEvents — nullable = defaults).
+C. Key management per project:
+   - API keys: 32-byte RandomNumberGenerator key (returned to user EXACTLY
+     once on creation), store only SHA-256 hash + display prefix (first 8
+     chars). Revoke endpoint (soft revoke: RevokedAtUtc).
+   - Project RSA keypair: RSA.Create(2048) per project. PublicKeyPem stored
+     clear; PrivateKeyEncrypted = AES-256-GCM of the private PEM with master
+     key from configuration ("SealedTrace:MasterKey"; document Azure KeyVault
+     upgrade path; MasterKeyVersion column supports rotation). Private key
+     cached decrypted in IMemoryCache per project.
+D. Ingest endpoint (section 3.3): validate API key -> project, enforce size +
+   rate limits, dedup by batchId (IngestBatches table, unique PK), decrypt each
+   envelope (RSA.Decrypt OaepSHA256 -> AesGcm.Decrypt), parse + validate events
+   (level enum; reject ts > now+5min), save Logs rows + IngestBatches row in
+   ONE transaction, respond 202. p95 < 300ms for a 50-envelope request. Use
+   EF Core bulk insert (AddRange) + SaveChanges batching.
+E. Query API (JWT auth + project ownership check):
+   GET /projects/{id}/logs?level=&tag=&from=&to=&userId=&sessionId=&search=
+       &cursor=&limit=(<=200) — keyset pagination on (ClientTs DESC, Id DESC),
+       cursor = base64("ts|id"); search via SQL Server Full-Text on Message
+       (FromSqlRaw CONTAINS) with LIKE fallback (decide in implementation
+       file).
+   GET /projects/{id}/stats?from=&to= — level distribution, events/day, top
+       tags, top user ids.
+F. Retention job (BackgroundService, nightly, e.g. 03:00): per-project policy,
+   batched DELETE (10k rows per loop) to avoid long locks.
+G. Hardening: rate limiting per API key (ASP.NET 8 built-in RateLimiter,
+   fixed window 600 req/min per key — or AspNetCoreRateLimit; pick one),
+   ingest body limit 2MB (Kestrel MaxRequestBodySize + JSON options), CORS
+   restricted to console origin, Serilog structured logging (file + console,
+   REDACT api keys/private keys), /health + /health/ready (DB check via
+   Microsoft.Extensions.Diagnostics.HealthChecks), Swashbuckle Swagger with
+   Bearer + X-Api-Key security schemes.
+H. Observability: counters (ingest accepted/duplicate/rejected, decrypt
+   failures) via System.Diagnostics.Metrics + prometheus-net to /metrics
+   (optional — note it).
+
+### 4.3 SQL Server schema (EF Core migrations; same DDL as all SealedTrace variants)
+Users(Id uniqueidentifier PK, Email unique, PasswordHash, Name, CreatedAtUtc)
+Projects(Id PK, OwnerId FK, Name, Slug unique, CreatedAtUtc, RetentionMaxAgeDays
+         null, RetentionMaxEvents null)
+ApiKeys(Id PK, ProjectId FK, KeyHash, KeyPrefix, CreatedAtUtc, RevokedAtUtc null)
+ProjectKeys(Id PK, ProjectId FK, Algorithm, PublicKeyPem, PrivateKeyEncrypted
+            varbinary, MasterKeyVersion int, CreatedAtUtc)
+IngestBatches(BatchId uniqueidentifier PK, ProjectId FK, ReceivedAtUtc,
+              EventCount int, EnvelopeSize int)
+Logs(Id uniqueidentifier PK, ProjectId FK, BatchId FK, ClientTs datetime2(3),
+     ReceivedAtUtc, Level tinyint, Tag nvarchar(128), Message nvarchar(max),
+     Error nvarchar(max) null, StackTrace nvarchar(max) null, MetadataJson
+     nvarchar(max) null, SessionId uniqueidentifier null, UserId nvarchar(128)
+     null, Seq bigint, AppVersion nvarchar(32) null, Platform nvarchar(16) null)
+RefreshTokens(Id PK, UserId FK, TokenHash, ExpiresAtUtc, RevokedAtUtc null,
+              ReplacedByTokenHash null)
+Indexes: Logs(ProjectId, ClientTs DESC, Id DESC); Logs(ProjectId, Level,
+ClientTs DESC); Logs(ProjectId, Tag); FULLTEXT catalog on Logs(Message) via
+raw migration (EF Core does not manage full-text indexes).
+
+## 5. PART B — SealedTrace Console (React 18 + TypeScript + Vite)
+### 5.1 Stack
+Vite + React 18 + TypeScript (strict), React Router v6, TanStack Query v5,
+Tailwind CSS + shadcn/ui, Recharts, zustand (auth state), fetch wrapper with
+JWT auto-refresh interceptor, ESLint + Prettier.
+
+### 5.2 Screens
+1. Auth: Login / Register (email+password), protected routes, redirect flow.
+2. Dashboard: project cards (name, env, today's event count, last received),
+   "New Project" button.
+3. Project Create Wizard: name + description -> success screen shown ONCE with:
+   (a) API key (copy button + "shown only once" warning), (b) public key PEM
+   (collapsible), (c) COPYABLE Flutter init snippet (pre-filled Dart code with
+   baseUrl/projectId/apiKey/publicKeyPem placeholders).
+4. Log Explorer (main screen): filter bar (level multi-select chips, tag, time
+   presets 15m/1h/24h/7d/custom, userId, sessionId, debounced search);
+   virtualized table (react-window or tanstack-virtual: time, level chip, tag,
+   message preview) with cursor "Load more"; detail drawer (full message,
+   error, stackTrace, metadata as collapsible JSON tree, copy-as-JSON).
+5. Stats: level distribution (donut), events timeline (area), top tags, top
+   users (bar).
+6. Settings: API keys table (prefix, created, revoke + confirm modal), retention
+   policy form, project rename, danger zone (delete project with typed confirm).
+UX: dark theme default, loading skeletons, empty states, error toasts, keyboard
+shortcut "/" to focus search, responsive down to tablet.
+
+## 6. NON-FUNCTIONAL
+- C#: nullable enabled, records for DTOs, FluentValidation or data annotations
+  on all inputs, global exception middleware (RFC7807 problem+json via
+  IProblemDetailsService), integration tests (WebApplicationFactory +
+  Testcontainers MSSQL) for ingest -> decrypt -> query roundtrip using golden
+  vectors. xUnit + FluentAssertions + NSubstitute/Moq.
+- Console: no `any` in TS strict; all API types in src/types/api.ts matching
+  section 3 exactly; 90% Lighthouse on login page.
+- Security: never log private keys, API keys, or plaintext PII; HTTPS only;
+  JWT secret + master key from configuration/user-secrets/KeyVault (never
+  committed).
+
+## 7. DELIVERABLE — IMPLEMENTATION.md FORMAT
+Produce exactly these sections:
+1. Assumptions & Resolved Questions
+2. System architecture (ASCII: SDK -> Ingest API -> Decrypt Service -> SQL
+   Server <- Query API <- Console; key flows: key issuance, ingest, query)
+3. Server solution tree + Console folder tree
+4. SQL Server DDL (EF Core migration list + CREATE TABLE statements + indexes)
+5. REST API reference (every endpoint: method, path, auth, request/response
+   JSON, error codes) — OpenAPI-style
+6. Contract compliance checklist vs section 3 (must match SDK spec exactly)
+7. PHASE-WISE PLAN:
+   Backend: B1 solution scaffold + EF Core + SQL Server + Serilog + Swagger +
+   health, B2 auth (register/login/refresh/me) + tests, B3 projects CRUD +
+   API keys + RSA keypair issuance + master-key encryption of private key,
+   B4 ingest endpoint + decrypt service + idempotent batch storage +
+   golden-vector tests, B5 query/stats APIs (keyset pagination + full-text
+   search), B6 retention job + rate limiting + body limits + docker-compose +
+   hardening.
+   Frontend: F1 scaffold + auth pages + route guards, F2 dashboard + create
+   wizard + one-time key display + Flutter snippet, F3 log explorer (filters +
+   virtualized table + detail drawer), F4 stats + settings (keys/retention/
+   danger zone), F5 polish (dark theme, empty/error states, keyboard nav) +
+   Lighthouse pass.
+   Each phase: goal, files touched, task checklist, acceptance criteria, tests.
+8. Dependency list (NuGet + npm, versions + why) — expect: Microsoft.EntityFrameworkCore.SqlServer, Microsoft.AspNetCore.Authentication.JwtBearer,
+   BCrypt.Net-Next, Serilog.AspNetCore + sinks, Swashbuckle.AspNetCore,
+   AspNetCoreRateLimit (or built-in RateLimiter), FluentValidation.AspNetCore,
+   Testcontainers.MsSql, xUnit, FluentAssertions; frontend as in section 5.1.
+9. Risks & mitigations (ingest throughput, EF batching on Logs inserts, DB
+   growth, key loss/rotation story, full-text search cost, clock skew)
+END. Stop after generating IMPLEMENTATION.md. Wait for my review before writing
+any code.
